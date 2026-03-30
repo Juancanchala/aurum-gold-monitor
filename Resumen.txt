@@ -1,0 +1,143 @@
+┌─────────────────────────────────────────────────────────────┐
+│                     FUENTE DE DATOS                         │
+│                      GoldAPI.io                             │
+│         Precio real XAU/USD cada 300 segundos               │
+│         JSON: price, open, high, low, currency              │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ HTTP GET cada 5 min
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      INGESTA                                │
+│                    producer.py                              │
+│         Lee la API · serializa a JSON · publica             │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ evento JSON
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    STREAMING                                │
+│                 Apache Kafka                                │
+│              Topic: gold_prices                             │
+│    Desacopla la ingesta del procesamiento                   │
+│    Garantiza que ningún evento se pierde                    │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ consume eventos
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   PROCESAMIENTO                             │
+│                   consumer.py                               │
+│   Calcula: MA(5) · volatilidad · tendencia · alertas        │
+│   Cada 10 ticks llama a ai_insights.py                      │
+└──────────┬──────────────────────────┬───────────────────────┘
+           │ persiste                 │ genera insight
+           ▼                          ▼
+┌─────────────────────┐   ┌──────────────────────────────────┐
+│    ALMACENAMIENTO   │   │           INTELIGENCIA           │
+│      SQLite         │   │          ai_insights.py          │
+│   raw_ticks         │   │       OpenAI GPT-4o-mini         │
+│   metrics           │   │  Analiza métricas → texto        │
+│   ai_insights       │   │  natural sobre el mercado        │
+└─────────┬───────────┘   └──────────────────────────────────┘
+          │ lee datos
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    SERVING LAYER                            │
+│                   api_server.py                             │
+│                     FastAPI                                 │
+│   /current · /history · /stats · /insights                  │
+│   /api/agent · /api/transcribe  ← proxy seguro OpenAI       │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ HTTP cada 15s
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  VISUALIZACIÓN                              │
+│                  dashboard.html                             │
+│   Precio live · Gráfico · AI Insights · Agente de voz       │
+│   Calculadora COP · Rentabilidad · Precio justo             │
+└─────────────────────────────────────────────────────────────┘
+Nota: Validar Predicciones del mercado MLops
+
+Primero: 
+FUENTE DE DATOS | GoldAPI.io
+"Consumimos la API REST de GoldAPI.io mediante HTTP GET cada 5 minutos. 
+Nos autenticamos con una API Key almacenada en variables de entorno por seguridad. 
+La respuesta es un JSON con precio spot, apertura, máximo y mínimo en USD por onza troy 
+— los datos base de todo el sistema."
+
+Segundo: 
+INGESTA | producer.py   
+"El producer es un script de python que corre en bucle infinito cada 5 minutos.
+Consukta GoldAPI, enriquece el JSON con timestamp y fuente (source), y publica el evento en Kafka.
+Cada publicación es un tick.
+Si la API falla, activa un fallback con movimiento Browniano - mismo modelo que usan los bancos para simnular precios -
+garantizando que Kafka siga recibiendo eventos sin interrupciones"
+
+Tercero:
+STREAMING | Apache Kafka
+"Kafka actúa como el broker de eventos entre el producer y el consumer.
+Su valor principal es el desacoplamiento - el producer publica sin depender de que el consumer esté disponible,
+, y si el consumer se cae y vuelve, retoma exactamente donde se quedó sin perder ningún evento.
+usamos un topic llamado gold_prices, es un consumer group y lo levantamos con Docker Compose,
+para levantar Kafka y Zookeeper como contenedores. 
+Zookeeper es el coordinador que gestiona el estado del clúster de Kafka — sin él Kafka no puede operar."
+
+Cuarto: 
+PROCESAMIENTO | Consumer.py
+"El consumer escucha el topic de Kafka permanentemente.
+Por cada tick que recibe calcula 5 métricas financieras: variación porcentual, media móvil de 5 periodos, volatilidad, tendencia y alertas de movimiento brusco.
+Usa ventana deslizante de 5 elementos para mantener solo los datos ma recientes.
+Es la capa donde viven las reglas del negocio - completamente adaptable según lo que el cliente necesite.
+Los umbrales de alerta, los cálculos y las métricas se configuran para cada caso de uso.
+Cada 10 ticks llama a GPT-4o-mini para generar un insight en lenguaje natural.
+La IA recibe métricas ya estructuradas y ni datos crudos, lo que mejora significativamente la calidad del análisis.
+Todo se persiste en SQLite. 
+La separación entre producer y consumer sigue el principio de arquitectura de responsabilidad única 
+- un fallo en el procesamiento nunca detiene la ingesta."
+
+Quinto:
+1 Almacenamiento: SQLite
+"Usamos SQLite con 3 tablas separadas: raw_ticks para el dato crudo inmutable, metrics para las métricas calculadas y ai_insights para los anpalisis de IA.
+Separa el dato crudo del procesado es un principio fundamental de la ingeniería de datos,
+si cambian las reglas del negocio puedes recalcular sin perder la fuente de la verdad.
+SQLite es la decisión correcta para este volumen. En producción con al ta frecuencia migraríamos a TimescaleDB,
+que es PostgreSQL optimizado para series de tiempo."
+
+2 Intelginecia: ai_insights.py
+"ai_insights.py es el módulo de IA del sistema.
+El consumer lo llama cada 10 ticks - le pasa las métricas ya calculadas y construye un prompt estructurado para GPT-4o-mini.
+La IA recibe el contexto rico - precio, tendencia, volatilidad y media móvil -
+lo que le permite generar análisis de valor real y no solo describir un número.
+El resultado se persisite en SQLite. Tiene fallback determinístico por si OpenAI no está disponible.
+El intervalo de 10ticks balancea calidad del anpalisis con costo de la API"
+
+Sexto: 
+Predicción ML (ml_predictor.py)
+"Agregamos una capa de predicción ML entre el almacenamiento y el serving layer. 
+Implementamos dos modelos en paralelo — Regresión Lineal y Random Forest — para predecir el precio del próximo tick usando como features el precio actual, 
+variación porcentual, media móvil y volatilidad.
+Elegimos estos dos modelos deliberadamente para poder compararlos. 
+La Regresión Lineal es interpretable — puedes explicar exactamente por qué predijo ese precio. 
+El Random Forest captura relaciones no lineales entre las variables pero es menos interpretable. 
+En finanzas ese tradeoff entre interpretabilidad y precisión es una decisión de negocio importante.
+El modelo genera un buy score de 0 a 100 — no una predicción absoluta sino una señal de contexto para el analista. 
+Somos honestos sobre las limitaciones: el precio del oro depende de factores externos que el modelo no captura, por eso lo presentamos como apoyo a la decisión y no como oráculo."
+
+Séptimo:
+SERVING LAYER | api_server.py | FastAPI
+"El serving layer es una API REST construida con FastAPI.
+Actúa como puente entre SQLite y el dashboard - expone 5 endpoints de datos y 2 endpoints proxy para OpenAI.
+Se eligió FastAPI por su alto rendimeinto, soporte asyn nativo y documentación autompatica con Swagger.
+El proxy de OpneAI es una decisión de seguridad - la API key vive solo en el servidor, el browser nunca la ve ni la puede interceptar."
+
+Octavo: 
+VISUALIZACIÓN | dashboard.html
+"El dashboard es un archivo html único con estética glassmorphism que consumme la API cada 15 segundos mediante polling.
+Presenta precio en tiempo real, gráfico histórico com MA(5), insights de IA, calculadoras de conversión y rentabilidad con pureza,
+y un agente conversacional con voz.
+Todas las llamadas a OpenAI van por el proxy del backend -el dashboard nunca maneja credenciales.
+Se eligió un HTML único por portabilidad y simplicidad de deploy, aunque en producción se migraría a react."
+
+GoldAPI.io → producer.py → Kafka → consumer.py → SQLite
+                                        ↓              ↓
+                                  ai_insights    api_server.py
+                                                      ↓
+                                               dashboard.html

@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+gold_monitor.db
+*.db
+.DS_Store
+node_modules/
