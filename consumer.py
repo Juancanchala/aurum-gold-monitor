@@ -20,7 +20,7 @@ from collections import deque
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, TopicPartition
 from ai_insights import generate_insight   # local module
 
 load_dotenv()
@@ -170,13 +170,7 @@ def run():
     kwargs = dict(
         bootstrap_servers=KAFKA_SERVERS,
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="gold_monitor_group",
         api_version=(2, 5, 0),
-        session_timeout_ms=30000,
-        heartbeat_interval_ms=3000,
-        max_poll_interval_ms=300000,
     )
     if KAFKA_SECURITY_PROTOCOL != "PLAINTEXT":
         kwargs.update(
@@ -186,8 +180,11 @@ def run():
             sasl_plain_password=KAFKA_SASL_PASSWORD,
             ssl_check_hostname=True,
         )
-    consumer = KafkaConsumer(KAFKA_TOPIC, **kwargs)
-    log.info("Listening on topic: %s", KAFKA_TOPIC)
+    consumer = KafkaConsumer(**kwargs)
+    tp = TopicPartition(KAFKA_TOPIC, 0)
+    consumer.assign([tp])
+    consumer.seek_to_beginning(tp)
+    log.info("Assigned partition 0 of topic: %s", KAFKA_TOPIC)
 
     tick_count = 0
     try:
