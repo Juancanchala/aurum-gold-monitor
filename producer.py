@@ -114,8 +114,38 @@ def run():
     tick_count = 0
 
     try:
+        price_history: list = []
         while True:
-            tick = _fetch_real_price() or _simulated_tick()
+            tick = _fetch_real_price()
+            if tick is None:
+                if len(price_history) >= 2:
+                    # Linear extrapolation from recent trend
+                    n = len(price_history)
+                    avg_change = (price_history[-1] - price_history[0]) / (n - 1)
+                    estimated_price = round(price_history[-1] + avg_change, 2)
+                    last = {k: v for k, v in zip(
+                        ["open", "high", "low", "currency", "metal"],
+                        [estimated_price, estimated_price, estimated_price, "USD", "XAU"]
+                    )}
+                    tick = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "price":     estimated_price,
+                        "open":      estimated_price,
+                        "high":      estimated_price,
+                        "low":       estimated_price,
+                        "currency":  "USD",
+                        "metal":     "XAU",
+                        "source":    "estimated",
+                    }
+                    log.warning("yfinance unavailable — estimated price %.2f from trend", estimated_price)
+                else:
+                    log.warning("yfinance unavailable and insufficient history — skipping tick")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+            else:
+                price_history.append(tick["price"])
+                if len(price_history) > 10:
+                    price_history.pop(0)
             log.info("Attempting to publish tick to topic: %s", KAFKA_TOPIC)
             try:
                 producer.send(KAFKA_TOPIC, value=tick)
