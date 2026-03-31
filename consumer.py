@@ -2,7 +2,7 @@
 Gold Price Consumer / Processor
 ---------------------------------
 Consumes raw ticks from Kafka topic 'gold_prices',
-calculates derived metrics, persists to SQLite, and
+calculates derived metrics, persists to PostgreSQL, and
 triggers AI insight generation every N ticks.
 
 Tables:
@@ -13,12 +13,13 @@ Tables:
 
 import os
 import json
-import sqlite3
 import logging
 import statistics
 from datetime import datetime, timezone
 from collections import deque
 from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
 from kafka import KafkaConsumer
 from ai_insights import generate_insight   # local module
 
@@ -27,13 +28,13 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 KAFKA_SERVERS            = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC              = os.getenv("KAFKA_TOPIC", "gold_prices")
-DB_PATH                  = os.getenv("DB_PATH", "gold_monitor.db")
+DATABASE_URL             = os.getenv("DATABASE_URL", "")
+INSIGHT_EVERY            = 10  # generate AI insight every N ticks
+MA_WINDOW                = 5   # moving average window
 KAFKA_SASL_USERNAME      = os.getenv("KAFKA_SASL_USERNAME", "")
 KAFKA_SASL_PASSWORD      = os.getenv("KAFKA_SASL_PASSWORD", "")
 KAFKA_SECURITY_PROTOCOL  = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 KAFKA_SASL_MECHANISM     = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
-INSIGHT_EVERY   = 10  # generate AI insight every N ticks
-MA_WINDOW       = 5   # moving average window
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,10 +49,11 @@ price_window: deque = deque(maxlen=MA_WINDOW)
 
 
 # ── Database setup ────────────────────────────────────────────────────────────
-def init_db(conn: sqlite3.Connection):
-    conn.executescript("""
+def init_db(conn):
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS raw_ticks (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            id        SERIAL PRIMARY KEY,
             ts        TEXT NOT NULL,
             price     REAL NOT NULL,
             open      REAL,
@@ -59,11 +61,12 @@ def init_db(conn: sqlite3.Connection):
             low       REAL,
             currency  TEXT DEFAULT 'USD',
             source    TEXT,
-            created   TEXT DEFAULT (datetime('now'))
-        );
-
+            created   TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS metrics (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            SERIAL PRIMARY KEY,
             tick_id       INTEGER REFERENCES raw_ticks(id),
             ts            TEXT NOT NULL,
             price         REAL NOT NULL,
@@ -72,23 +75,25 @@ def init_db(conn: sqlite3.Connection):
             volatility    REAL,
             trend         TEXT,
             alert         TEXT,
-            created       TEXT DEFAULT (datetime('now'))
-        );
-
+            created       TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_insights (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            id       SERIAL PRIMARY KEY,
             ts       TEXT NOT NULL,
             insight  TEXT NOT NULL,
             price    REAL,
-            created  TEXT DEFAULT (datetime('now'))
-        );
+            created  TIMESTAMPTZ DEFAULT NOW()
+        )
     """)
     conn.commit()
-    log.info("SQLite DB initialised at: %s", DB_PATH)
+    cur.close()
+    log.info("PostgreSQL DB initialised")
 
 
 # ── Metrics calculation ────────────────────────────────────────────────────────
-def compute_metrics(tick: dict, conn: sqlite3.Connection) -> dict:
+def compute_metrics(tick: dict, conn) -> dict:
     price = tick["price"]
     price_window.append(price)
 
@@ -99,9 +104,10 @@ def compute_metrics(tick: dict, conn: sqlite3.Connection) -> dict:
     volatility = round(statistics.stdev(price_window), 4) if len(price_window) >= 2 else 0.0
 
     # % change vs previous tick
-    prev_row = conn.execute(
-        "SELECT price FROM raw_ticks ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT price FROM raw_ticks ORDER BY id DESC LIMIT 1")
+    prev_row = cur.fetchone()
+    cur.close()
     prev_price = prev_row[0] if prev_row else price
     change_pct = round(((price - prev_price) / prev_price) * 100, 4) if prev_price else 0.0
 
@@ -133,30 +139,32 @@ def compute_metrics(tick: dict, conn: sqlite3.Connection) -> dict:
 
 
 # ── Persist tick + metrics ────────────────────────────────────────────────────
-def persist(tick: dict, metrics: dict, conn: sqlite3.Connection) -> int:
-    cur = conn.execute(
+def persist(tick: dict, metrics: dict, conn) -> int:
+    cur = conn.cursor()
+    cur.execute(
         "INSERT INTO raw_ticks (ts, price, open, high, low, currency, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (tick["timestamp"], tick["price"], tick.get("open"),
          tick.get("high"), tick.get("low"), tick.get("currency", "USD"), tick.get("source")),
     )
-    tick_id = cur.lastrowid
+    tick_id = cur.fetchone()[0]
 
-    conn.execute(
+    cur.execute(
         "INSERT INTO metrics (tick_id, ts, price, change_pct, ma10, volatility, trend, alert) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
         (tick_id, tick["timestamp"], tick["price"],
          metrics["change_pct"], metrics["ma10"], metrics["volatility"],
          metrics["trend"], metrics["alert"]),
     )
     conn.commit()
+    cur.close()
     return tick_id
 
 
 # ── Main consumer loop ────────────────────────────────────────────────────────
 def run():
     log.info("Starting Gold Price Consumer")
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = psycopg2.connect(DATABASE_URL)
     init_db(conn)
 
     kwargs = dict(
@@ -193,16 +201,21 @@ def run():
 
             # Generate AI insight every N ticks
             if tick_count % INSIGHT_EVERY == 0:
-                recent = conn.execute(
+                cur = conn.cursor()
+                cur.execute(
                     "SELECT price, change_pct, ma10, volatility, trend FROM metrics "
                     "ORDER BY id DESC LIMIT 10"
-                ).fetchall()
+                )
+                recent = cur.fetchall()
+                cur.close()
                 insight_text = generate_insight(tick, metrics, recent)
-                conn.execute(
-                    "INSERT INTO ai_insights (ts, insight, price) VALUES (?, ?, ?)",
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO ai_insights (ts, insight, price) VALUES (%s, %s, %s)",
                     (tick["timestamp"], insight_text, tick["price"]),
                 )
                 conn.commit()
+                cur.close()
                 log.info("AI insight saved.")
 
     except KeyboardInterrupt:

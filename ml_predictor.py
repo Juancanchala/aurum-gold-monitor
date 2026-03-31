@@ -8,27 +8,30 @@ Returns predicted price, buy_score (0–100), confidence, and a
 combined recommendation for both models.
 """
 
-import sqlite3
 import logging
 import numpy as np
+import psycopg2
+import psycopg2.extras
 
 log = logging.getLogger(__name__)
 
 MIN_RECORDS = 20
 
 
-def _load_data(db_path: str, n: int = 200):
-    """Return feature matrix X and target vector y from SQLite."""
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
+def _load_data(database_url: str, n: int = 200):
+    """Return feature matrix X and target vector y from PostgreSQL."""
+    conn = psycopg2.connect(database_url)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT t.price, m.change_pct, m.ma10, m.volatility "
         "FROM raw_ticks t JOIN metrics m ON m.tick_id = t.id "
-        "ORDER BY t.id ASC LIMIT ?",
+        "ORDER BY t.id ASC LIMIT %s",
         (n,),
-    ).fetchall()
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
     conn.close()
-    return [dict(r) for r in rows]
+    return rows
 
 
 def _build_xy(rows: list):

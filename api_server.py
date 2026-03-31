@@ -1,7 +1,7 @@
 """
 Gold Monitor — REST API
 -----------------------
-FastAPI server that reads from SQLite and exposes endpoints
+FastAPI server that reads from PostgreSQL and exposes endpoints
 consumed by the HTML dashboard via fetch/polling.
 
 Endpoints:
@@ -13,10 +13,11 @@ Endpoints:
 """
 
 import os
-import sqlite3
 import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,7 +27,7 @@ log = logging.getLogger(__name__)
 
 load_dotenv()
 
-DB_PATH        = os.getenv("DB_PATH", "gold_monitor.db")
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE    = "https://api.openai.com/v1"
 
@@ -42,8 +43,7 @@ app.add_middleware(
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 
@@ -51,11 +51,14 @@ def get_db():
 @app.get("/status")
 def status():
     conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM raw_ticks").fetchone()[0]
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM raw_ticks")
+    count = cur.fetchone()[0]
+    cur.close()
     conn.close()
     return {
-        "status": "ok",
-        "db_path": DB_PATH,
+        "status":      "ok",
+        "db":          "postgresql",
         "total_ticks": count,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
@@ -65,21 +68,23 @@ def status():
 @app.get("/current")
 def current():
     conn = get_db()
-
-    tick_row = conn.execute(
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT t.ts, t.price, t.open, t.high, t.low, t.source, "
         "       m.change_pct, m.ma10, m.volatility, m.trend, m.alert "
         "FROM raw_ticks t "
         "JOIN metrics m ON m.tick_id = t.id "
         "ORDER BY t.id DESC LIMIT 1"
-    ).fetchone()
-
+    )
+    tick_row = cur.fetchone()
     if not tick_row:
+        cur.close()
+        conn.close()
         raise HTTPException(status_code=404, detail="No data yet. Is the producer running?")
 
-    insight_row = conn.execute(
-        "SELECT insight, ts FROM ai_insights ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    cur.execute("SELECT insight, ts FROM ai_insights ORDER BY id DESC LIMIT 1")
+    insight_row = cur.fetchone()
+    cur.close()
     conn.close()
 
     return {
@@ -104,14 +109,17 @@ def current():
 def history(n: int = 50):
     n = min(max(n, 5), 200)
     conn = get_db()
-    rows = conn.execute(
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT t.ts, t.price, m.ma10, m.change_pct, m.trend "
         "FROM raw_ticks t JOIN metrics m ON m.tick_id = t.id "
-        "ORDER BY t.id DESC LIMIT ?",
+        "ORDER BY t.id DESC LIMIT %s",
         (n,),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
-    return [dict(r) for r in reversed(rows)]   # chronological order
+    return [dict(r) for r in reversed(rows)]
 
 
 # ── /insights ────────────────────────────────────────────────────────────────
@@ -119,9 +127,12 @@ def history(n: int = 50):
 def insights(n: int = 5):
     n = min(max(n, 1), 20)
     conn = get_db()
-    rows = conn.execute(
-        "SELECT ts, insight, price FROM ai_insights ORDER BY id DESC LIMIT ?", (n,)
-    ).fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT ts, insight, price FROM ai_insights ORDER BY id DESC LIMIT %s", (n,)
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -130,19 +141,24 @@ def insights(n: int = 5):
 @app.get("/stats")
 def stats():
     conn = get_db()
-    row = conn.execute(
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT COUNT(*) as cnt, MAX(price) as high, MIN(price) as low, "
         "       MAX(price) - MIN(price) as range_ "
-        "FROM raw_ticks WHERE ts >= datetime('now', '-24 hours')"
-    ).fetchone()
+        "FROM raw_ticks WHERE ts::TIMESTAMPTZ >= NOW() - INTERVAL '24 hours'"
+    )
+    row = cur.fetchone()
 
-    first = conn.execute(
-        "SELECT price FROM raw_ticks WHERE ts >= datetime('now', '-24 hours') "
+    cur.execute(
+        "SELECT price FROM raw_ticks "
+        "WHERE ts::TIMESTAMPTZ >= NOW() - INTERVAL '24 hours' "
         "ORDER BY id ASC LIMIT 1"
-    ).fetchone()
-    last = conn.execute(
-        "SELECT price FROM raw_ticks ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    )
+    first = cur.fetchone()
+
+    cur.execute("SELECT price FROM raw_ticks ORDER BY id DESC LIMIT 1")
+    last = cur.fetchone()
+    cur.close()
     conn.close()
 
     open_p  = first["price"] if first else None
@@ -150,11 +166,11 @@ def stats():
     chg_24h = round(((close_p - open_p) / open_p) * 100, 3) if open_p and close_p else None
 
     return {
-        "ticks_24h":   row["cnt"],
-        "high_24h":    row["high"],
-        "low_24h":     row["low"],
-        "range_24h":   row["range_"],
-        "change_24h":  chg_24h,
+        "ticks_24h":  row["cnt"],
+        "high_24h":   row["high"],
+        "low_24h":    row["low"],
+        "range_24h":  row["range_"],
+        "change_24h": chg_24h,
     }
 
 
@@ -163,7 +179,7 @@ def stats():
 def prediction():
     try:
         import ml_predictor
-        return ml_predictor.predict(DB_PATH)
+        return ml_predictor.predict(DATABASE_URL)
     except Exception as exc:
         log.error("ML prediction error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -179,11 +195,14 @@ async def agent(req: AgentRequest):
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured on server.")
 
     conn = get_db()
-    tick_row = conn.execute(
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         "SELECT t.price, m.change_pct, m.ma10, m.volatility, m.trend "
         "FROM raw_ticks t JOIN metrics m ON m.tick_id = t.id "
         "ORDER BY t.id DESC LIMIT 1"
-    ).fetchone()
+    )
+    tick_row = cur.fetchone()
+    cur.close()
     conn.close()
 
     if tick_row:
