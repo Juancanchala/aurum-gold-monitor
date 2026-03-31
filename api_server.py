@@ -20,6 +20,7 @@ import psycopg2
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import httpx
 
@@ -45,6 +46,12 @@ app.add_middleware(
 def get_db():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
+
+
+# ── / dashboard ──────────────────────────────────────────────────────────────
+@app.get("/")
+def dashboard():
+    return FileResponse("dashboard.html", media_type="text/html")
 
 
 # ── /status ──────────────────────────────────────────────────────────────────
