@@ -1,10 +1,10 @@
 """
 Gold Price Producer
 -------------------
-Fetches gold price from GoldAPI.io every POLL_INTERVAL seconds
+Fetches gold price from Yahoo Finance (yfinance) every POLL_INTERVAL seconds
 and publishes each tick as a JSON event to the Kafka topic 'gold_prices'.
 
-API: https://www.goldapi.io  (free tier: ~30 req/day)
+Source: yfinance GC=F (Gold Futures) — free, no API key required.
 Fallback: simulated price stream for local dev/demo
 """
 
@@ -16,16 +16,19 @@ import random
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from kafka import KafkaProducer
-import requests
+import yfinance as yf
 
 load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────────────
-GOLD_API_KEY        = os.getenv("GOLD_API_KEY", "")
 KAFKA_SERVERS       = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC         = os.getenv("KAFKA_TOPIC", "gold_prices")
 POLL_INTERVAL       = int(os.getenv("POLL_INTERVAL", "300"))
-GOLDAPI_URL         = "https://www.goldapi.io/api/XAU/USD"
+YFINANCE_TICKER     = "GC=F"
+KAFKA_SASL_USERNAME      = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD      = os.getenv("KAFKA_SASL_PASSWORD", "")
+KAFKA_SECURITY_PROTOCOL  = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SASL_MECHANISM     = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,40 +58,48 @@ def _simulated_tick() -> dict:
     }
 
 
-# ── Real API fetch ───────────────────────────────────────────────────────────
+# ── Real price fetch via yfinance ────────────────────────────────────────────
 def _fetch_real_price() -> dict | None:
-    """Fetch live price from GoldAPI.io. Returns None on any error."""
-    if not GOLD_API_KEY or GOLD_API_KEY == "your_goldapi_key_here":
-        return None
+    """Fetch live gold price from Yahoo Finance. Returns None on any error."""
     try:
-        headers = {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"}
-        resp = requests.get(GOLDAPI_URL, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        ticker = yf.Ticker(YFINANCE_TICKER)
+        info = ticker.fast_info
+        price = info.last_price
+        if not price:
+            return None
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "price":     data.get("price"),
-            "open":      data.get("open_price"),
-            "high":      data.get("high_price"),
-            "low":       data.get("low_price"),
+            "price":     round(float(price), 2),
+            "open":      round(float(info.open), 2) if info.open else None,
+            "high":      round(float(info.day_high), 2) if info.day_high else None,
+            "low":       round(float(info.day_low), 2) if info.day_low else None,
             "currency":  "USD",
             "metal":     "XAU",
-            "source":    "goldapi.io",
+            "source":    "yahoo_finance",
         }
     except Exception as exc:
-        log.warning("GoldAPI fetch failed: %s — falling back to simulation", exc)
+        log.warning("yfinance fetch failed: %s — falling back to simulation", exc)
         return None
 
 
 # ── Kafka producer setup ──────────────────────────────────────────────────────
 def build_producer() -> KafkaProducer:
-    return KafkaProducer(
+    kwargs = dict(
         bootstrap_servers=KAFKA_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         acks="all",
         retries=3,
         linger_ms=100,
     )
+    if KAFKA_SECURITY_PROTOCOL != "PLAINTEXT":
+        kwargs.update(
+            security_protocol=KAFKA_SECURITY_PROTOCOL,
+            sasl_mechanism=KAFKA_SASL_MECHANISM,
+            sasl_plain_username=KAFKA_SASL_USERNAME,
+            sasl_plain_password=KAFKA_SASL_PASSWORD,
+            ssl_check_hostname=True,
+        )
+    return KafkaProducer(**kwargs)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -97,7 +108,7 @@ def run():
     log.info("Kafka broker  : %s", KAFKA_SERVERS)
     log.info("Topic         : %s", KAFKA_TOPIC)
     log.info("Poll interval : %ds", POLL_INTERVAL)
-    log.info("API key set   : %s", bool(GOLD_API_KEY and GOLD_API_KEY != "your_goldapi_key_here"))
+    log.info("Price source  : Yahoo Finance (%s)", YFINANCE_TICKER)
 
     producer = build_producer()
     tick_count = 0
@@ -105,13 +116,17 @@ def run():
     try:
         while True:
             tick = _fetch_real_price() or _simulated_tick()
-            producer.send(KAFKA_TOPIC, value=tick)
-            producer.flush()
-            tick_count += 1
-            log.info(
-                "✓ Tick #%d published | price=%.2f | source=%s",
-                tick_count, tick["price"], tick["source"],
-            )
+            log.info("Attempting to publish tick to topic: %s", KAFKA_TOPIC)
+            try:
+                producer.send(KAFKA_TOPIC, value=tick)
+                producer.flush(timeout=30)
+                tick_count += 1
+                log.info(
+                    "✓ Tick #%d published | price=%.2f | source=%s",
+                    tick_count, tick["price"], tick["source"],
+                )
+            except Exception as e:
+                log.error("Send failed: %s: %s", type(e).__name__, e)
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:

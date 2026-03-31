@@ -25,9 +25,13 @@ from ai_insights import generate_insight   # local module
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KAFKA_SERVERS   = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "gold_prices")
-DB_PATH         = os.getenv("DB_PATH", "gold_monitor.db")
+KAFKA_SERVERS            = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC              = os.getenv("KAFKA_TOPIC", "gold_prices")
+DB_PATH                  = os.getenv("DB_PATH", "gold_monitor.db")
+KAFKA_SASL_USERNAME      = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD      = os.getenv("KAFKA_SASL_PASSWORD", "")
+KAFKA_SECURITY_PROTOCOL  = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+KAFKA_SASL_MECHANISM     = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 INSIGHT_EVERY   = 10  # generate AI insight every N ticks
 MA_WINDOW       = 5   # moving average window
 
@@ -155,14 +159,22 @@ def run():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     init_db(conn)
 
-    consumer = KafkaConsumer(
-        KAFKA_TOPIC,
+    kwargs = dict(
         bootstrap_servers=KAFKA_SERVERS,
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         auto_offset_reset="earliest",
         enable_auto_commit=True,
         group_id="gold_monitor_group",
     )
+    if KAFKA_SECURITY_PROTOCOL != "PLAINTEXT":
+        kwargs.update(
+            security_protocol=KAFKA_SECURITY_PROTOCOL,
+            sasl_mechanism=KAFKA_SASL_MECHANISM,
+            sasl_plain_username=KAFKA_SASL_USERNAME,
+            sasl_plain_password=KAFKA_SASL_PASSWORD,
+            ssl_check_hostname=True,
+        )
+    consumer = KafkaConsumer(KAFKA_TOPIC, **kwargs)
     log.info("Listening on topic: %s", KAFKA_TOPIC)
 
     tick_count = 0

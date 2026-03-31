@@ -213,20 +213,83 @@ The **Buy Score** (0–100) maps predicted price direction to a signal, dampened
 
 ## Deployment on Railway
 
-1. Push the repository to GitHub.
-2. Create a new project on [Railway](https://railway.app) and connect the repo.
-3. Set environment variables in Railway's dashboard (see table above).
-4. Railway will detect the `Procfile` and deploy automatically.
-5. After deployment, copy your Railway URL and update `dashboard.html`:
+AURUM deploys as **three separate Railway services** from the same GitHub repository, each using a different Procfile.
+
+### Prerequisites
+
+- Redpanda Cloud cluster (or any Kafka-compatible broker) with SASL_SSL credentials
+- GitHub repository with this code pushed
+
+### Step 1 — Push to GitHub
+
+```bash
+git add .
+git commit -m "feat: Railway deploy config"
+git push origin main
+```
+
+### Step 2 — Create the three services on Railway
+
+On [railway.app](https://railway.app), create a **new project** and add three services, all pointing to the same GitHub repo:
+
+| Service name | Procfile to use | Process type |
+|---|---|---|
+| `aurum-api` | `Procfile` | `web` — exposes public URL |
+| `aurum-producer` | `Procfile.producer` | `worker` — no public URL |
+| `aurum-consumer` | `Procfile.consumer` | `worker` — no public URL |
+
+For each service, set the **Custom Start Command** in Railway's settings to the content of its Procfile:
+
+- **aurum-api:** `uvicorn api_server:app --host 0.0.0.0 --port $PORT`
+- **aurum-producer:** `python producer.py`
+- **aurum-consumer:** `python consumer.py`
+
+### Step 3 — Set environment variables
+
+Add these variables to **each of the three services** in Railway's Variables tab:
+
+```env
+OPENAI_API_KEY=your_openai_key_here
+KAFKA_BOOTSTRAP_SERVERS=your-cluster.redpanda.com:9092
+KAFKA_TOPIC=gold_prices
+KAFKA_SECURITY_PROTOCOL=SASL_SSL
+KAFKA_SASL_MECHANISM=SCRAM-SHA-256
+KAFKA_SASL_USERNAME=your-username
+KAFKA_SASL_PASSWORD=your-password
+POLL_INTERVAL=300
+DB_PATH=/data/gold_monitor.db
+```
+
+> `PORT` is injected automatically by Railway for the `web` service — do not set it manually.
+
+### Step 4 — Add a persistent volume (consumer + api)
+
+The consumer writes to SQLite and the API reads from it. Attach a Railway **Volume** to both `aurum-consumer` and `aurum-api`, mounted at `/data`, so they share the same database file.
+
+### Step 5 — Update the dashboard API URL
+
+After `aurum-api` is deployed, copy its public Railway URL and update `dashboard.html`:
 
 ```js
 // dashboard.html — line ~630
 const API_BASE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:8000'
-  : 'https://YOUR-APP.up.railway.app';   // ← replace this
+  : 'https://YOUR-APP.up.railway.app';   // ← replace with your Railway URL
 ```
 
-> **Note:** Kafka requires a separate broker service (e.g., Upstash Kafka or Confluent Cloud) when deploying to Railway. The API server and dashboard work independently of Kafka — they only read from SQLite.
+### Architecture on Railway
+
+```
+Redpanda Cloud (SASL_SSL)
+        │
+        ├──▶  aurum-producer  (worker) — fetches Yahoo Finance, publishes ticks
+        │
+        └──▶  aurum-consumer  (worker) — processes stream, writes SQLite on /data volume
+                                                │
+                                    aurum-api  (web)  ← reads same /data volume
+                                        │
+                                    dashboard.html (browser)
+```
 
 ---
 
